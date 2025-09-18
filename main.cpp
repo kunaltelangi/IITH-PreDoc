@@ -1,4 +1,5 @@
 #include <bits/stdc++.h>
+#include <omp.h>
 using namespace std;
 
 const uint8_t sbox[256] = {
@@ -92,7 +93,7 @@ void sm4_encrypt(const uint32_t plain[4], const uint32_t rk[32], uint32_t cipher
         x[i + 4] = x[i] ^ l;
     }
     for (int i = 0; i < 4; ++i) {
-        cipher[i] = x[32 + i];
+        cipher[i] = x[35 - i];
     }
 }
 
@@ -126,6 +127,11 @@ void precompute_lat() {
     }
 }
 
+double compute_multi_round_bias(double single_bias) {
+    const int num_rounds = 6;
+    return pow(2.0, num_rounds - 1) * pow(single_bias, num_rounds);
+}
+
 int main() {
     init_ck();
     precompute_lat();
@@ -137,72 +143,98 @@ int main() {
     uint32_t plain[4] = {0x01234567, 0x89abcdef, 0xfedcba98, 0x76543210};
     uint32_t cipher[4];
     sm4_encrypt(plain, rk, cipher);
-    // Expected cipher: 0x681edf34, 0xd206965e, 0x86b3e94f, 0x536e4246
     printf("Encryption test: %08x %08x %08x %08x\n", cipher[0], cipher[1], cipher[2], cipher[3]);
 
     uint32_t dec_plain[4];
     sm4_decrypt(cipher, rk, dec_plain);
     printf("Decryption test: %08x %08x %08x %08x\n", dec_plain[0], dec_plain[1], dec_plain[2], dec_plain[3]);
 
-    // Bias search for 3 active S-boxes
+    // Bias search for 3 active S-boxes (single round)
     double max_bias = 0.0;
     uint32_t best_gamma = 0;
-    uint64_t total_checked = 0;
     uint64_t active_three = 0;
     const uint64_t total = 1ULL << 32;
-    for (uint64_t gg = 0; gg < total; ++gg) {
-        uint32_t gamma = static_cast<uint32_t>(gg);
-        uint32_t delta = SM4_LT(gamma);
-        uint8_t alpha[4], beta[4];
-        int num_active = 0;
-        double prod_eps = 1.0;
-        bool valid = true;
-        for (int i = 0; i < 4; ++i) {
-            alpha[i] = (gamma >> ((3 - i) * 8)) & 0xFF;  // MSB first
-            beta[i] = (delta >> ((3 - i) * 8)) & 0xFF;
-            if (alpha[i] == 0 && beta[i] == 0) {
-                // Trivial, skip
-                continue;
+    uint64_t progress_counter = 0;
+
+    #pragma omp parallel reduction(+:active_three, progress_counter)
+    {
+        double local_max_bias = 0.0;
+        uint32_t local_best_gamma = 0;
+        #pragma omp for schedule(dynamic)
+        for (uint64_t gg = 0; gg < total; ++gg) {
+            uint32_t gamma = static_cast<uint32_t>(gg);
+            uint32_t delta = SM4_LT(gamma);
+            uint8_t alpha[4], beta[4];
+            int num_active = 0;
+            double prod_eps = 1.0;
+            bool valid = true;
+            for (int i = 0; i < 4; ++i) {
+                alpha[i] = (gamma >> ((3 - i) * 8)) & 0xFF;  // MSB first
+                beta[i] = (delta >> ((3 - i) * 8)) & 0xFF;
+                if (alpha[i] == 0 && beta[i] == 0) {
+                    continue;
+                }
+                if (alpha[i] == 0 || beta[i] == 0) {
+                    valid = false;
+                    break;
+                }
+                int entry = lat[alpha[i]][beta[i]];
+                double eps_i = fabs(static_cast<double>(entry) / 256.0 - 0.5);
+                if (eps_i == 0.0) {
+                    valid = false;
+                    break;
+                }
+                prod_eps *= eps_i;
+                ++num_active;
             }
-            if (alpha[i] == 0 || beta[i] == 0) {
-                // Inconsistent, bias 0
-                valid = false;
-                break;
+            if (valid && num_active == 3) {
+                ++active_three;
+                double bias = pow(2.0, static_cast<double>(num_active) - 1.0) * prod_eps;
+                if (bias > local_max_bias) {
+                    local_max_bias = bias;
+                    local_best_gamma = gamma;
+                }
             }
-            // Both non-zero
-            int entry = lat[alpha[i]][beta[i]];
-            double eps_i = fabs(static_cast<double>(entry) / 256.0 - 0.5);
-            if (eps_i == 0.0) {
-                valid = false;
-                break;
+
+            if ((gg % (1ULL << 20)) == 0) {
+                progress_counter += (1ULL << 20);
             }
-            prod_eps *= eps_i;
-            ++num_active;
         }
-        ++total_checked;
-        if (valid && num_active == 3) {
-            ++active_three;
-            double bias = pow(2.0, static_cast<double>(num_active) - 1.0) * prod_eps;
-            if (bias > max_bias) {
-                max_bias = bias;
-                best_gamma = gamma;
+        #pragma omp critical
+        {
+            if (local_max_bias > max_bias) {
+                max_bias = local_max_bias;
+                best_gamma = local_best_gamma;
             }
-        }
-        if ((gg % (1ULL << 20)) == 0) {
-            double perc = static_cast<double>(gg) / static_cast<double>(total) * 100.0;
-            printf("Progress: %llu / %llu (%.2f%%), Active 3: %llu\n", gg, total, perc, active_three);
         }
     }
+    uint64_t total_checked = total;
     double log_bias = log2(max_bias);
+    double perc = static_cast<double>(progress_counter) / static_cast<double>(total) * 100.0;
+    printf("Progress: %llu / %llu (%.2f%%), Active 3: %llu\n", progress_counter, total, perc, active_three);
     printf("Best gamma: 0x%08x\n", best_gamma);
-    printf("Max bias: %e (2^{%.4f})\n", max_bias, log_bias);
+    printf("Max single-round bias: %e (2^{%.4f})\n", max_bias, log_bias);
     printf("Total checked: %llu, with 3 active: %llu\n", total_checked, active_three);
+
+    // Print bias for rounds 1-18
+    const int approximated_rounds[] = {5, 6, 10, 11, 15, 16};
+    set<int> approx_set(approximated_rounds, approximated_rounds + 6);
+    for (int r = 1; r <= 18; ++r) {
+        double round_bias = approx_set.count(r) ? max_bias : 0.0;
+        double round_log_bias = approx_set.count(r) ? log_bias : -INFINITY;
+        printf("Bias for round %d: %e (2^{%.4f})\n", r, round_bias, round_log_bias);
+    }
+
+    // Compute and print multi-round bias using piling-up lemma
+    double multi_bias = compute_multi_round_bias(max_bias);
+    double multi_log_bias = log2(multi_bias);
+    printf("Final multi-round bias (piling-up over 6 rounds): %e (2^{%.4f})\n", multi_bias, multi_log_bias);
 
     // Verification for best gamma
     uint32_t delta = SM4_LT(best_gamma);
     uint32_t check = SM4_L(delta);
     if (check == best_gamma) {
-        printf("Verification: L(L^T(gamma)) == gamma? Wait, actually we check if the approximation holds structurally: OK if masks consistent.\n");
+        printf("Verification: L(L^T(gamma)) == gamma? OK if masks consistent.\n");
     }
 
     return 0;
